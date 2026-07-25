@@ -4,10 +4,17 @@ Reproducible builds of a **minimal static `ffmpeg`** for [Tango](https://github.
 
 Tango doesn't link `libav*` — it ships a standalone `ffmpeg` binary next to
 the app and shells out to it to encode replay exports
-(`tango-pvp/src/replay/export.rs`). This repo builds that binary for every
+(`encoder-facade/src/backend/ffmpeg`). This repo builds that binary for every
 platform Tango ships on, containing **only** the codecs/muxers/filters the
 exporter actually drives and nothing else (we start from
 `--disable-everything` and re-enable feature by feature).
+
+ffmpeg is only an **encoder** here. Tango runs one child per stream — raw
+frames or samples in on stdin, a fragmented MP4 carrying that one stream out
+on stdout — and assembles the container the user actually gets (MP4 or
+Matroska, with chapters, cues and colour tags) in Rust, from those fragments.
+So this build has no Matroska muxer, nothing to demux with, no stream-copy
+path, and no filesystem access at all.
 
 It replaces the previously-bundled `eugeneware/ffmpeg-static` b6.0 builds,
 which carry the full kitchen-sink ffmpeg (~70 MB) when Tango uses a sliver
@@ -44,40 +51,42 @@ They're also attached to the run as plain Artifacts for quick debugging.
 Single source of truth: [`scripts/ffmpeg-config-common.sh`](scripts/ffmpeg-config-common.sh).
 Every line is traced to a Tango code path:
 
-| Component                          | Tango usage                                                  |
-| ---------------------------------- | ----------------------------------------------------------- |
-| encoder `libx264`                  | scaled export — `-c:v libx264 -vf scale=…,format=yuv420p`   |
-| encoder `libx264rgb`               | lossless export (scale = 0) — `-c:v libx264rgb -qp 0`       |
-| encoder `aac`                      | scaled-export audio — `-c:a aac -b:a 384k`                  |
-| encoder `flac`                     | lossless-export audio — `-c:a flac`                          |
-| decoders `rawvideo`, `pcm_s16le`   | the raw RGBA / s16le streams piped from the emulator        |
-| demuxers `rawvideo`, `pcm_s16le`   | `-f rawvideo` / `-f s16le` inputs                            |
-| demuxer `matroska`                 | mux step reads back the intermediate `.mkv`s                |
-| muxer `matroska`                   | intermediates (`-f matroska`) + the final `.mkv` (lossless) |
-| muxers `mov`/`mp4`                  | the final `.mp4` (scaled export)                            |
-| parsers `h264`, `aac`, `flac`      | stream-copy mux (`-c:v copy -c:a copy`)                     |
-| bsf `extract_extradata`            | write `avcC` when copying H.264 into MP4                    |
-| bsf `aac_adtstoasc`                | AAC stream-copy safety                                      |
-| filters `scale`, `format`          | nearest-neighbour upscale + pixel-format conversion         |
-| filters `aresample`/`aformat`/…    | auto-inserted s16 → fltp etc. negotiation                   |
-| protocols `file`, `pipe`           | temp files + `-i pipe:`                                     |
-| external `libx264` (GPL)           | the H.264 encoders above (`--enable-gpl`)                   |
+| Component                          | Tango usage                                                   |
+| ---------------------------------- | ------------------------------------------------------------- |
+| encoder `libx264`                  | scaled export — `-c:v libx264 -vf scale=…,format=yuv420p`     |
+| encoder `libx264rgb`               | lossless export — `-c:v libx264rgb -qp 0`                     |
+| encoder `aac`                      | lossy-export audio — `-c:a aac -b:a 384k`                     |
+| encoder `flac`                     | lossless-export audio — `-c:a flac`                            |
+| decoders `rawvideo`, `pcm_s16le`   | the raw RGBA / s16le streams piped from the emulator          |
+| demuxers `rawvideo`, `pcm_s16le`   | `-f rawvideo` / `-f s16le` inputs                              |
+| muxers `mov`/`mp4`                  | the fragmented-MP4 transport each child writes to `pipe:1`    |
+| parser `av1`                       | driven by nothing here; links in anyway on some platforms     |
+| bsf `extract_extradata`            | movenc lifts H.264 parameter sets into `avcC` with it         |
+| filters `scale`, `format`          | nearest-neighbour upscale + pixel-format conversion           |
+| filter `setparams`                 | the sRGB/BT.709 colour tags the scaled path carries           |
+| filters `aresample`/`aformat`/…    | auto-inserted s16 → fltp etc. negotiation                     |
+| protocol `pipe`                    | `-i pipe:` in, `-f mp4 pipe:1` out — the only I/O a child does |
+| external `libx264` (GPL)           | the H.264 encoders above (`--enable-gpl`)                     |
 
 The side-by-side ("twosided") export is composited in Rust and piped as one
 double-width rawvideo stream, so **no** `hstack`/`overlay` filter is needed.
 
-Tango writes its per-stream intermediate temp files as **matroska**
-(`-f matroska`, see `tango-pvp/src/replay/export.rs`) and stream-copies them
-into the final container. **Scaled** exports produce an `.mp4` (with
-`-movflags +faststart`); **lossless** exports (libx264rgb + FLAC, which mp4
-only carries via experimental flags) produce an `.mkv` instead — the save
-dialog picks the extension to match.
+Each child is asked for `-movflags empty_moov+default_base_moof` with a
+`-frag_duration`, so its output is a `moov` describing the track followed by
+a `moof`/`mdat` pair per quarter-second of media. That is what Tango reads
+its packets back out of: the fragments state each sample's size, duration
+and sync flag, and the `moov` carries the codec configuration — so nothing
+has to be recovered by parsing a bitstream, and no stream is ever held whole
+until the export ends. **Lossless** exports (libx264rgb + FLAC) land in an
+`.mkv`, **scaled** ones in an `.mp4`; both containers are written by Tango,
+not by this binary.
 
 The resulting binaries are GPL (because of x264).
 
 Each build is **smoke-tested** ([`scripts/smoke-test.sh`](scripts/smoke-test.sh))
-by running Tango's exact command sequence — both encode paths, both audio
-codecs, and the `flac`-in-MP4 / `h264`-in-MP4 stream-copy mux — so a build
+by running Tango's exact commands — both video paths, both audio codecs,
+pipe in and pipe out — and checking that what comes back is fragmented, and
+that the video track kept the exact GBA timebase it was asked for. A build
 missing any enabled component fails in CI rather than in a user's export.
 
 ## Versions
